@@ -2659,6 +2659,29 @@ def DockerCreate(name, cmd, image, memory, cpus, disk, network, port, cmd_id):
         except Exception as e:
             _emit(f"[DockerCreate] archiware inject warn: {e}", 20)
 
+# Ubuntu: enable NET_ADMIN + tun device for WireGuard/VPN support
+        try:
+            img_lower = str(image).lower()
+            if any(tok in img_lower for tok in ("ubuntu",)):
+                _emit(f"[DockerCreate] ubuntu image detected: enabling NET_ADMIN + tun", 20)
+                create_kwargs["privileged"] = True
+                create_kwargs["cap_add"] = (create_kwargs.get("cap_add") or []) + ["NET_ADMIN", "SYS_MODULE"]
+                create_kwargs["sysctls"] = {"net.ipv4.conf.all.src_valid_mark": "1"}
+                if os.path.exists("/dev/net/tun"):
+                    create_kwargs["devices"] = (create_kwargs.get("devices") or []) + ["/dev/net/tun:/dev/net/tun:rwm"]
+                if create_kwargs.get("mounts") is None:
+                    create_kwargs["mounts"] = []
+                create_kwargs["mounts"].append(
+                    docker.types.Mount(
+                        type="bind",
+                        source="/lib/modules",
+                        target="/lib/modules",
+                        read_only=True
+                    )
+                )
+        except Exception as e:
+            _emit(f"[DockerCreate] ubuntu inject warn: {e}", 20)
+
         # >>> IMPORTANT: pass primary_net so container is NOT on default 'bridge'
         c = cli.containers.create(**create_kwargs)
 
@@ -2877,6 +2900,19 @@ def DockerStart(name, cmd, cmd_id):
                     _emit(f"[DockerStart][{cmd_id}] archiware devices added: {devs}", 20)
             except Exception as e:
                 _emit(f"[DockerStart][{cmd_id}] archiware inject warn: {e}", 20)
+
+            # Ubuntu: preserve NET_ADMIN + tun on restart
+            try:
+                img_lower = str((info.get("Config") or {}).get("Image") or "").lower()
+                if any(tok in img_lower for tok in ("ubuntu",)):
+                    _emit(f"[DockerStart][{cmd_id}] ubuntu image: re-applying NET_ADMIN + tun", 20)
+                    create_kwargs["privileged"] = True
+                    create_kwargs["cap_add"] = (create_kwargs.get("cap_add") or []) + ["NET_ADMIN", "SYS_MODULE"]
+                    create_kwargs["sysctls"] = {"net.ipv4.conf.all.src_valid_mark": "1"}
+                    if os.path.exists("/dev/net/tun"):
+                        create_kwargs["devices"] = (create_kwargs.get("devices") or []) + ["/dev/net/tun:/dev/net/tun:rwm"]
+            except Exception as e:
+                _emit(f"[DockerStart][{cmd_id}] ubuntu inject warn: {e}", 20)
             c = cli.containers.create(**create_kwargs)
 
             # (re)attach to additional user networks if any
