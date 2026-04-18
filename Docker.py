@@ -465,6 +465,33 @@ def _build_port_bindings_for_single_host_port(image_obj, host_port):
         container_key = f"{hp}/tcp"
     return {container_key: hp}
 
+def _is_kdenlive_image_name(image_name) -> bool:
+    try:
+        return "kdenlive" in str(image_name).lower()
+    except Exception:
+        return False
+
+def _force_single_host_port_binding(port_map, target_container_port):
+    """
+    Rewrite a single published host port to a specific container port.
+    If multiple published ports exist, leave the mapping unchanged.
+    """
+    if not port_map:
+        return port_map
+    if target_container_port in port_map:
+        return port_map
+
+    published = []
+    for ckey, host_binding in (port_map or {}).items():
+        if host_binding not in (None, "", [], {}):
+            published.append((ckey, host_binding))
+
+    if len(published) != 1:
+        return port_map
+
+    _old_key, host_binding = published[0]
+    return {target_container_port: host_binding}
+
 def _gather_existing_binds(info_attrs):
     vols = {}
     for m in info_attrs.get("Mounts", []) or []:
@@ -2578,6 +2605,8 @@ def DockerCreate(name, cmd, image, memory, cpus, disk, network, port, cmd_id):
 
         # ---- single-host-port publishing ----
         ports_map = _build_port_bindings_for_single_host_port(img, port)
+        if _is_kdenlive_image_name(image):
+            ports_map = _force_single_host_port_binding(ports_map, "3001/tcp")
 
         host_kwargs = {}
         if mem_limit is not None: host_kwargs["mem_limit"] = mem_limit
@@ -2682,6 +2711,32 @@ def DockerCreate(name, cmd, image, memory, cpus, disk, network, port, cmd_id):
         except Exception as e:
             _emit(f"[DockerCreate] ubuntu inject warn: {e}", 20)
 
+# Kdenlive: browser-based video editor — needs software GL, audio, shm
+        try:
+            img_lower = str(image).lower()
+            if any(tok in img_lower for tok in ("kdenlive",)):
+                _emit(f"[DockerCreate] kdenlive image detected: applying display/audio env", 20)
+                existing_env = list(create_kwargs.get("environment") or [])
+                kdenlive_env = {
+                    "LIBGL_ALWAYS_SOFTWARE": "1",
+                    "MLT_NO_VAAPI":          "1",
+                    "GALLIUM_DRIVER":        "llvmpipe",
+                    "SDL_VIDEODRIVER":       "offscreen",
+                    "XDG_RUNTIME_DIR":       "/run/user/911",
+                    # Selkies-based Kdenlive requires HTTPS for WebCodecs/audio.
+                    "HTTPS_ONLY":            "true",
+                    "LAUNCH_NOHTTPS":        "false",
+                }
+                existing_keys = {e.split("=", 1)[0] for e in existing_env if "=" in e}
+                for k, v in kdenlive_env.items():
+                    if k not in existing_keys:
+                        existing_env.append(f"{k}={v}")
+                create_kwargs["environment"] = existing_env
+                create_kwargs["shm_size"] = create_kwargs.get("shm_size") or (1 * 1024 * 1024 * 1024)
+                if os.path.exists("/dev/dri"):
+                    create_kwargs["devices"] = (create_kwargs.get("devices") or []) + ["/dev/dri:/dev/dri:rwm"]
+        except Exception as e:
+            _emit(f"[DockerCreate] kdenlive inject warn: {e}", 20)
         # >>> IMPORTANT: pass primary_net so container is NOT on default 'bridge'
         c = cli.containers.create(**create_kwargs)
 
@@ -2784,13 +2839,24 @@ def DockerStart(name, cmd, cmd_id):
         missing_sys_masks = not all(p in tmpfs_cfg for p in ("/sys/block",
                                                              "/sys/class/block",
                                                              "/sys/devices/virtual/block"))
-        fix_needed = has_bad_proc_bind or missing_sys_masks
+        kdenlive_wrong_https_port = False
+        try:
+            image_name = (info.get("Config") or {}).get("Image") or ""
+            if _is_kdenlive_image_name(image_name):
+                current_port_bind = _ports_from_info(info)
+                normalized = _force_single_host_port_binding(current_port_bind, "3001/tcp") or {}
+                kdenlive_wrong_https_port = normalized != (current_port_bind or {})
+        except Exception:
+            kdenlive_wrong_https_port = False
+
+        fix_needed = has_bad_proc_bind or missing_sys_masks or kdenlive_wrong_https_port
 
         if fix_needed:
             from docker.types import Mount
 
             _emit(f"[DockerStart][{cmd_id}] legacy config detected "
-                  f"(bad_proc={has_bad_proc_bind}, missing_sys_masks={missing_sys_masks}) — repairing by recreate", 20)
+                  f"(bad_proc={has_bad_proc_bind}, missing_sys_masks={missing_sys_masks}, "
+                  f"kdenlive_wrong_https_port={kdenlive_wrong_https_port}) — repairing by recreate", 20)
 
             # capture config to recreate
             image        = (info.get("Config") or {}).get("Image")
@@ -2802,6 +2868,8 @@ def DockerStart(name, cmd, cmd_id):
             restart_pol  = hostcfg.get("RestartPolicy") or {"Name": "unless-stopped"}
             net_mode     = hostcfg.get("NetworkMode") or None
             port_bind    = _ports_from_info(info)
+            if _is_kdenlive_image_name(image):
+                port_bind = _force_single_host_port_binding(port_bind, "3001/tcp")
             limits       = _host_config_limits(info)
             volumes      = _gather_existing_binds(info)  # dict {src: {bind:dst,mode:..}}
 
@@ -2913,6 +2981,33 @@ def DockerStart(name, cmd, cmd_id):
                         create_kwargs["devices"] = (create_kwargs.get("devices") or []) + ["/dev/net/tun:/dev/net/tun:rwm"]
             except Exception as e:
                 _emit(f"[DockerStart][{cmd_id}] ubuntu inject warn: {e}", 20)
+
+# Kdenlive: re-apply display/audio env on restart
+            try:
+                img_lower = str((info.get("Config") or {}).get("Image") or "").lower()
+                if any(tok in img_lower for tok in ("kdenlive",)):
+                    _emit(f"[DockerStart][{cmd_id}] kdenlive image: re-applying display/audio env", 20)
+                    existing_env = list(create_kwargs.get("environment") or [])
+                    kdenlive_env = {
+                        "LIBGL_ALWAYS_SOFTWARE": "1",
+                        "MLT_NO_VAAPI":          "1",
+                        "GALLIUM_DRIVER":        "llvmpipe",
+                        "SDL_VIDEODRIVER":       "offscreen",
+                        "XDG_RUNTIME_DIR":       "/run/user/911",
+                        # Selkies-based Kdenlive requires HTTPS for WebCodecs/audio.
+                        "HTTPS_ONLY":            "true",
+                        "LAUNCH_NOHTTPS":        "false",
+                    }
+                    existing_keys = {e.split("=", 1)[0] for e in existing_env if "=" in e}
+                    for k, v in kdenlive_env.items():
+                        if k not in existing_keys:
+                            existing_env.append(f"{k}={v}")
+                    create_kwargs["environment"] = existing_env
+                    create_kwargs["shm_size"] = create_kwargs.get("shm_size") or (1 * 1024 * 1024 * 1024)
+                    if os.path.exists("/dev/dri"):
+                        create_kwargs["devices"] = (create_kwargs.get("devices") or []) + ["/dev/dri:/dev/dri:rwm"]
+            except Exception as e:
+                _emit(f"[DockerStart][{cmd_id}] kdenlive inject warn: {e}", 20)
             c = cli.containers.create(**create_kwargs)
 
             # (re)attach to additional user networks if any

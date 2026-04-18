@@ -13,11 +13,17 @@ function RedirectToConsole(imageName,portNo,directUrl)
         'kibana', 'xibo', 'erpnext', 'mahara','openproject','logicaldoc','canvas','tastyigniter',
         'openemr','frontaccounting','akaunting','yetiforce','cliniccases','screenly','alluxio','syncthing',
         'jupyter','ospos','nextcloud','open-xchange','jitsi',"ubuntu-os", "ubuntu-os-ssh","jellyfin","portainer",
-		"elasticsearch","solr","opensis:9.1","ubuntu-gotty:1.0","mysql:8.0","kdenlive","kdenlive:1.0","sanuyirepo/kdenlive:1.0"
+		"elasticsearch","solr","opensis:9.1","ubuntu-gotty:1.0","mysql:8.0"
     ]
     if(defaultImages.includes(imageName))
 	{				
         url = url
+    }
+    else if(imageName=='kdenlive' || imageName=='kdenlive:1.0' || imageName=='sanuyirepo/kdenlive:1.0') {
+        if (portNo == null) {
+            port = '3001';
+        }
+        url = "https://" + currentLocation + ":" + port;
     }
     else if(imageName=='odoo') {
         url = url + "/web/database/manager";
